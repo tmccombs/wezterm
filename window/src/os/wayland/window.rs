@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::cell::{RefCell, RefMut};
+use std::cell::RefCell;
 use std::cmp::max;
 use std::convert::TryInto;
 use std::io::Read;
@@ -14,18 +14,18 @@ use anyhow::{anyhow, bail};
 use async_io::Timer;
 use async_trait::async_trait;
 use config::ConfigHandle;
-use filedescriptor::FileDescriptor;
 use promise::{Future, Promise};
 use raw_window_handle::{
     HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle,
     WaylandDisplayHandle, WaylandWindowHandle,
 };
 use smithay_client_toolkit::compositor::{CompositorHandler, SurfaceData, SurfaceDataExt};
-use smithay_client_toolkit::shell::xdg::frame::fallback_frame::FallbackFrame;
-use smithay_client_toolkit::shell::xdg::frame::{DecorationsFrame, FrameAction};
+use smithay_client_toolkit::data_device_manager::ReadPipe;
+use smithay_client_toolkit::seat::pointer::CursorIcon;
+use smithay_client_toolkit::shell::xdg::fallback_frame::FallbackFrame;
 use smithay_client_toolkit::shell::xdg::window::{
     DecorationMode, Window as XdgWindow, WindowConfigure, WindowDecorations as Decorations,
-    WindowHandler, WindowState as SCTKWindowState,
+    WindowHandler,
 };
 use smithay_client_toolkit::shell::xdg::XdgSurface;
 use smithay_client_toolkit::shell::WaylandSurface;
@@ -34,7 +34,9 @@ use wayland_client::protocol::wl_keyboard::{Event as WlKeyboardEvent, KeyState};
 use wayland_client::protocol::wl_pointer::{ButtonState, WlPointer};
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection as WConnection, Proxy};
+use wayland_csd_frame::{DecorationsFrame, FrameAction, WindowState as CsdWindowState};
 use wayland_egl::{is_available as egl_is_available, WlEglSurface};
+use wayland_protocols::xdg::shell::client::xdg_toplevel;
 use wezterm_font::FontConfiguration;
 use wezterm_input_types::{
     KeyboardLedStatus, Modifiers, MouseButtons, MouseEvent, MouseEventKind, MousePress,
@@ -193,11 +195,6 @@ impl WaylandWindow {
             compositor.create_surface_with_data(&qh, surface_data)
         };
 
-        let pointer_surface = {
-            let compositor = &conn.wayland_state.borrow().compositor;
-            compositor.create_surface(&qh)
-        };
-
         let ResolvedGeometry {
             x: _,
             y: _,
@@ -211,54 +208,33 @@ impl WaylandWindow {
             dpi: config.dpi.unwrap_or(crate::DEFAULT_DPI) as usize,
         };
 
+        let decorations = config.window_decorations;
+        let decorations_mode = if decorations == WindowDecorations::NONE {
+            Decorations::None
+        } else if decorations == WindowDecorations::default() {
+            Decorations::ServerDefault
+        } else {
+            // SCTK/Wayland don't allow more nuance than "decorations are hidden",
+            // so if we have a mixture of things, then we need to force our
+            // client side decoration rendering.
+            Decorations::RequestClient
+        };
+
         let window = {
             let xdg_shell = &conn.wayland_state.borrow().xdg;
-            xdg_shell.create_window(surface.clone(), Decorations::RequestServer, &qh)
+            xdg_shell.create_window(surface.clone(), decorations_mode, &qh)
         };
 
         window.set_app_id(class_name.to_string());
         window.set_title(name.to_string());
-        let decorations = config.window_decorations;
-
-        let decor_mode = if decorations == WindowDecorations::NONE {
-            None
-        } else if decorations == WindowDecorations::default() {
-            Some(DecorationMode::Server)
-        } else {
-            Some(DecorationMode::Client)
-        };
-        window.request_decoration_mode(decor_mode);
-
-        let mut window_frame = {
-            let wayland_state = &conn.wayland_state.borrow();
-            let shm = &wayland_state.shm;
-            let subcompositor = wayland_state.subcompositor.clone();
-            FallbackFrame::new(&window, shm, subcompositor, qh.clone())
-                .expect("failed to create csd frame")
-        };
-        let hidden = match decor_mode {
-            Some(DecorationMode::Client) => false,
-            _ => true,
-        };
-        window_frame.set_hidden(hidden);
-        if !hidden {
-            window_frame.resize(
-                NonZeroU32::new(dimensions.pixel_width as u32)
-                    .ok_or_else(|| anyhow!("dimensions {dimensions:?} are invalid"))?,
-                NonZeroU32::new(dimensions.pixel_height as u32)
-                    .ok_or_else(|| anyhow!("dimensions {dimensions:?} are invalid"))?,
-            );
-        }
 
         window.set_min_size(Some((32, 32)));
-        let (w, h) = window_frame.add_borders(
+        window.set_window_geometry(
+            0,
+            0,
             dimensions.pixel_width as u32,
             dimensions.pixel_height as u32,
         );
-        let (x, y) = window_frame.location();
-        window
-            .xdg_surface()
-            .set_window_geometry(x, y, w as i32, h as i32);
         window.commit();
 
         let copy_and_paste = CopyAndPaste::create();
@@ -275,7 +251,7 @@ impl WaylandWindow {
             copy_and_paste,
             invalidated: false,
             window: Some(window),
-            window_frame,
+            decorations: None,
             dimensions,
             resize_increments: None,
             window_state: WindowState::default(),
@@ -290,7 +266,6 @@ impl WaylandWindow {
             key_repeat: None,
             pending_event,
             pending_mouse,
-            pointer_surface,
 
             pending_first_configure: Some(pending_first_configure),
             frame_callback: None,
@@ -456,7 +431,6 @@ impl WindowOps for WaylandWindow {
 pub(crate) struct PendingEvent {
     pub(crate) close: bool,
     pub(crate) had_configure_event: bool,
-    refresh_decorations: bool,
     // XXX: configure and window_configure could probably be combined, but right now configure only
     // queues a new size, so it can be out of sync. Example would be maximizing and minimizing winodw
     pub(crate) configure: Option<(u32, u32)>,
@@ -465,10 +439,10 @@ pub(crate) struct PendingEvent {
     pub(crate) window_state: Option<WindowState>,
 }
 
-pub(crate) fn read_pipe_with_timeout(mut file: FileDescriptor) -> anyhow::Result<String> {
+pub(crate) fn read_pipe_with_timeout(mut file: ReadPipe) -> anyhow::Result<String> {
     let mut result = Vec::new();
 
-    file.set_non_blocking(true)?;
+    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
     let mut pfd = libc::pollfd {
         fd: file.as_raw_fd(),
         events: libc::POLLIN,
@@ -501,11 +475,10 @@ pub struct WaylandWindowInner {
     surface_factor: f64,
     copy_and_paste: Arc<Mutex<CopyAndPaste>>,
     window: Option<XdgWindow>,
-    pub(super) window_frame: FallbackFrame<WaylandState>,
+    pub(super) decorations: Option<FallbackFrame<WaylandState>>,
     dimensions: Dimensions,
     resize_increments: Option<ResizeIncrement>,
     window_state: WindowState,
-    pointer_surface: WlSurface,
     last_mouse_coords: Point,
     mouse_buttons: MouseButtons,
     hscroll_remainder: f64,
@@ -536,6 +509,7 @@ impl WaylandWindowInner {
     fn close(&mut self) {
         self.events.dispatch(WindowEvent::Destroyed);
         self.window.take();
+        self.decorations.take();
     }
 
     fn show(&mut self) {
@@ -548,11 +522,10 @@ impl WaylandWindowInner {
     }
 
     fn refresh_frame(&mut self) {
-        if let Some(window) = self.window.as_mut() {
-            if self.window_frame.is_dirty() && !self.window_frame.is_hidden() {
-                self.window_frame.draw();
+        if let Some(frame) = self.decorations.as_mut() {
+            if frame.is_dirty() && !frame.is_hidden() {
+                frame.draw();
             }
-            window.wl_surface().commit();
         }
     }
 
@@ -735,7 +708,7 @@ impl WaylandWindowInner {
         }
     }
 
-    pub(crate) fn dispatch_pending_event(&mut self) {
+    fn dispatch_pending_event(&mut self) {
         let mut pending;
         {
             let mut pending_events = self.pending_event.lock().unwrap();
@@ -767,11 +740,49 @@ impl WaylandWindowInner {
             }
         }
 
-        if let Some(ref window_config) = pending.window_configure {
-            self.window_frame.update_state(window_config.state);
-            self.window_frame
-                .update_wm_capabilities(window_config.capabilities);
-        }
+        let conn = Connection::get().unwrap().wayland();
+
+        if let Some(window_config) = pending.window_configure {
+            if self.window.is_some()
+                && window_config.decoration_mode == DecorationMode::Client
+                && self.config.window_decorations != WindowDecorations::NONE
+            {
+                log::trace!("Client side decoration");
+                // the server requested client side decoration
+                // create a frame, if we don't have one already
+                let title = self.title.as_ref();
+                let window = self.window.as_ref();
+                let decorations = self.decorations.get_or_insert_with(|| {
+                    let state = conn.wayland_state.borrow();
+                    let qh = WaylandConnection::get()
+                        .unwrap()
+                        .wayland()
+                        .event_queue
+                        .borrow()
+                        .handle()
+                        .clone();
+                    let mut frame = FallbackFrame::new(
+                        window.unwrap(),
+                        &state.shm,
+                        state.subcompositor.clone(),
+                        qh,
+                    )
+                    .expect("failed to create csd frame.");
+                    if let Some(title) = title {
+                        frame.set_title(title.clone());
+                    }
+                    frame.into()
+                });
+                decorations.set_hidden(false);
+                decorations.update_state(window_config.state);
+                decorations.update_wm_capabilities(window_config.capabilities);
+            } else {
+                if let Some(frame) = self.decorations.as_mut() {
+                    // If we have a frame already, hide it.
+                    frame.set_hidden(true);
+                }
+            }
+        };
 
         if let Some((mut w, mut h)) = pending.configure.take() {
             log::trace!("Pending configure: w:{w}, h{h} -- {:?}", self.window);
@@ -786,11 +797,29 @@ impl WaylandWindowInner {
                 // Do this early because this affects surface_to_pixels/pixels_to_surface
                 self.dimensions.dpi = dpi;
 
+                // we need to subtract the decorations before trying to resize
+                const MIN_PIXELS: NonZeroU32 = unsafe { NonZeroU32::new_unchecked(1) };
+                if let Some(ref dec) = self.decorations {
+                    if !dec.is_hidden() {
+                        let inner_size = dec.subtract_borders(
+                            NonZeroU32::new(w).unwrap(),
+                            NonZeroU32::new(h).unwrap(),
+                        );
+                        // Clamp the size to at least one pixel.
+                        let inner_width = inner_size.0.unwrap_or(MIN_PIXELS);
+                        let inner_height = inner_size.1.unwrap_or(MIN_PIXELS);
+                        w = inner_width.get();
+                        h = inner_height.get();
+                    }
+                }
+
                 let mut pixel_width = self.surface_to_pixels(w.try_into().unwrap());
                 let mut pixel_height = self.surface_to_pixels(h.try_into().unwrap());
 
                 if self.window_state.can_resize() {
-                    self.window_frame.set_resizable(true);
+                    if let Some(ref mut dec) = self.decorations {
+                        dec.set_resizable(true);
+                    }
                     if let Some(incr) = self.resize_increments {
                         let min_width = incr.base_width + incr.x;
                         let min_height = incr.base_height + incr.y;
@@ -801,29 +830,33 @@ impl WaylandWindowInner {
                             max(pixel_height - extra_height, min_height as i32);
                         w = self.pixels_to_surface(desired_pixel_width) as u32;
                         h = self.pixels_to_surface(desired_pixel_height) as u32;
-                        pixel_width = self.surface_to_pixels(w.try_into().unwrap());
-                        pixel_height = self.surface_to_pixels(h.try_into().unwrap());
                     }
                 }
 
-                log::trace!("Resizing frame");
-                let (width, height) = self.window_frame.subtract_borders(
-                    NonZeroU32::new(pixel_width as u32).unwrap(),
-                    NonZeroU32::new(pixel_height as u32).unwrap(),
-                );
-                // Clamp the size to at least one pixel.
-                let width = width.unwrap_or(NonZeroU32::new(1).unwrap());
-                let height = height.unwrap_or(NonZeroU32::new(1).unwrap());
-                if !self.window_frame.is_hidden() {
-                    self.window_frame.resize(width, height);
+                let window = self.window.as_ref().unwrap();
+
+                match self.decorations.as_mut() {
+                    Some(frame) if !frame.is_hidden() => {
+                        log::trace!("Resizing frame");
+                        frame.resize(w.try_into().unwrap(), h.try_into().unwrap());
+                        let outer_size = frame.add_borders(w, h);
+                        let (x, y) = frame.location();
+                        window.set_window_geometry(
+                            x.try_into().unwrap(),
+                            y.try_into().unwrap(),
+                            outer_size.0,
+                            outer_size.1,
+                        );
+                    }
+                    _ => {
+                        window.set_window_geometry(0, 0, w, h);
+                    }
                 }
-                let (x, y) = self.window_frame.location();
-                let outer_size = self.window_frame.add_borders(width.get(), height.get());
-                self.window
-                    .as_mut()
-                    .unwrap()
-                    .xdg_surface()
-                    .set_window_geometry(x, y, outer_size.0 as i32, outer_size.1 as i32);
+                // recompute  the pixel dimensions because they may have changed
+                // due to resizing or decorations
+                pixel_width = self.surface_to_pixels(w.try_into().unwrap());
+                pixel_height = self.surface_to_pixels(h.try_into().unwrap());
+
                 // Compute the new pixel dimensions
                 let new_dimensions = Dimensions {
                     pixel_width: pixel_width.try_into().unwrap(),
@@ -859,8 +892,7 @@ impl WaylandWindowInner {
                         wegl_surface.resize(pixel_width, pixel_height, 0, 0);
                     }
                     if self.surface_factor != factor {
-                        let wayland_conn = Connection::get().unwrap().wayland();
-                        let wayland_state = wayland_conn.wayland_state.borrow();
+                        let wayland_state = conn.wayland_state.borrow();
                         let mut pool = wayland_state.mem_pool.borrow_mut();
 
                         // Make a "fake" buffer with the right dimensions, as
@@ -882,9 +914,6 @@ impl WaylandWindowInner {
                 self.do_paint().unwrap();
             }
         }
-        if pending.refresh_decorations && self.window.is_some() {
-            self.refresh_frame();
-        }
         if pending.had_configure_event && self.window.is_some() {
             log::debug!("Had configured an event");
             if let Some(notify) = self.pending_first_configure.take() {
@@ -895,27 +924,20 @@ impl WaylandWindowInner {
     }
 
     fn set_cursor(&mut self, cursor: Option<MouseCursor>) {
-        let name = cursor.map_or("none", |cursor| match cursor {
-            MouseCursor::Arrow => "arrow",
-            MouseCursor::Hand => "hand",
-            MouseCursor::SizeUpDown => "ns-resize",
-            MouseCursor::SizeLeftRight => "ew-resize",
-            MouseCursor::Text => "xterm",
+        let icon = cursor.map_or(CursorIcon::Default, |cursor| match cursor {
+            MouseCursor::Arrow => CursorIcon::Default,
+            MouseCursor::Hand => CursorIcon::Pointer,
+            MouseCursor::SizeUpDown => CursorIcon::NsResize,
+            MouseCursor::SizeLeftRight => CursorIcon::EwResize,
+            MouseCursor::Text => CursorIcon::Text,
         });
         let conn = Connection::get().unwrap().wayland();
-        let state = conn.wayland_state.borrow_mut();
-        let (shm, pointer) =
-            RefMut::map_split(state, |s| (&mut s.shm, s.pointer.as_mut().unwrap()));
+        let mut state = conn.wayland_state.borrow_mut();
+        let pointer = state.pointer.as_mut().unwrap();
 
         // Much different API in 0.18
-        if let Err(err) = pointer.set_cursor(
-            &conn.connection,
-            name,
-            shm.wl_shm(),
-            &self.pointer_surface,
-            1,
-        ) {
-            log::error!("set_cursor: {}", err);
+        if let Err(err) = pointer.set_cursor(&conn.connection, icon) {
+            log::error!("set_cursor: (icon={}) {}", icon, err);
         }
     }
 
@@ -966,6 +988,9 @@ impl WaylandWindowInner {
         }
         if let Some(window) = self.window.as_ref() {
             window.set_title(title.clone());
+        }
+        if let Some(frame) = self.decorations.as_mut() {
+            frame.set_title(title.clone());
         }
         self.refresh_frame();
         self.title = Some(title);
@@ -1146,8 +1171,14 @@ impl WaylandWindowInner {
                     .unwrap()
                     .show_window_menu(seat, serial, (x, y))
             }
-            FrameAction::Resize(edge) => self.window.as_ref().unwrap().resize(seat, serial, edge),
+            FrameAction::Resize(edge) => {
+                self.window
+                    .as_ref()
+                    .unwrap()
+                    .resize(seat, serial, frame_edge_to_window_edge(edge))
+            }
             FrameAction::Move => self.window.as_ref().unwrap().move_(seat, serial),
+            _ => {} // just ignore unrecognized frame actions
         }
     }
 }
@@ -1157,7 +1188,7 @@ impl WaylandState {
         self.windows.borrow().get(&window_id).map(Rc::clone)
     }
 
-    fn handle_window_event(&self, window: &XdgWindow, event: WaylandWindowEvent) {
+    fn handle_window_event(&mut self, window: &XdgWindow, event: WaylandWindowEvent) {
         let surface_data = SurfaceUserData::from_wl(window.wl_surface());
         let window_id = surface_data.window_id;
 
@@ -1180,12 +1211,12 @@ impl WaylandState {
                 }
             }
             WaylandWindowEvent::Request(configure) => {
-                pending_event.window_configure.replace(configure.clone());
                 // TODO: This should the new queue function
                 // p.queue_configure(&configure)
                 //
                 let mut changed;
                 pending_event.had_configure_event = true;
+
                 if let (Some(w), Some(h)) = configure.new_size {
                     changed = pending_event.configure.is_none();
                     pending_event.configure.replace((w.get(), h.get()));
@@ -1194,14 +1225,14 @@ impl WaylandState {
                 }
 
                 let mut state = WindowState::default();
-                if configure.state.contains(SCTKWindowState::FULLSCREEN) {
+                if configure.state.contains(CsdWindowState::FULLSCREEN) {
                     state |= WindowState::FULL_SCREEN;
                 }
-                let fs_bits = SCTKWindowState::MAXIMIZED
-                    | SCTKWindowState::TILED_LEFT
-                    | SCTKWindowState::TILED_RIGHT
-                    | SCTKWindowState::TILED_TOP
-                    | SCTKWindowState::TILED_BOTTOM;
+                let fs_bits = CsdWindowState::MAXIMIZED
+                    | CsdWindowState::TILED_LEFT
+                    | CsdWindowState::TILED_RIGHT
+                    | CsdWindowState::TILED_TOP
+                    | CsdWindowState::TILED_BOTTOM;
                 if !((configure.state & fs_bits).is_empty()) {
                     state |= WindowState::MAXIMIZED;
                 }
@@ -1216,8 +1247,12 @@ impl WaylandState {
                 if pending_event.window_state.is_none() && state != WindowState::default() {
                     changed = true;
                 }
+                if pending_event.window_configure.is_none() {
+                    changed = true;
+                }
 
                 pending_event.window_state.replace(state);
+                pending_event.window_configure.replace(configure);
                 changed
             }
         };
@@ -1235,10 +1270,27 @@ impl CompositorHandler for WaylandState {
         &mut self,
         _conn: &WConnection,
         _qh: &wayland_client::QueueHandle<Self>,
-        _surface: &wayland_client::protocol::wl_surface::WlSurface,
-        _new_factor: i32,
+        surface: &wayland_client::protocol::wl_surface::WlSurface,
+        new_factor: i32,
     ) {
+        let window_id = SurfaceUserData::from_wl(surface).window_id;
+        WaylandConnection::with_window_inner(window_id, move |inner| {
+            if let Some(frame) = inner.decorations.as_mut() {
+                frame.set_scaling_factor(new_factor as f64);
+            }
+            Ok(())
+        });
         // We do nothing, we get the scale_factor from surface_data
+    }
+
+    fn transform_changed(
+        &mut self,
+        _conn: &WConnection,
+        _qh: &wayland_client::QueueHandle<Self>,
+        _surface: &wayland_client::protocol::wl_surface::WlSurface,
+        _new_transform: wayland_client::protocol::wl_output::Transform,
+    ) {
+        // Nothing to do here
     }
 
     fn frame(
@@ -1306,7 +1358,7 @@ unsafe impl HasRawWindowHandle for WaylandWindowInner {
     fn raw_window_handle(&self) -> RawWindowHandle {
         let mut handle = WaylandWindowHandle::empty();
         let surface = self.surface();
-        handle.surface = surface.id().as_ptr() as *mut _;
+        handle.surface = surface.id().interface().c_ptr.unwrap() as *const _ as *mut _;
         RawWindowHandle::Wayland(handle)
     }
 }
@@ -1315,7 +1367,13 @@ unsafe impl HasRawDisplayHandle for WaylandWindow {
     fn raw_display_handle(&self) -> RawDisplayHandle {
         let mut handle = WaylandDisplayHandle::empty();
         let conn = WaylandConnection::get().unwrap().wayland();
-        handle.display = conn.connection.backend().display_ptr() as *mut _;
+        handle.display = conn
+            .connection
+            .backend()
+            .display_id()
+            .interface()
+            .c_ptr
+            .unwrap() as *const _ as *mut _;
         RawDisplayHandle::Wayland(handle)
     }
 }
@@ -1330,5 +1388,24 @@ unsafe impl HasRawWindowHandle for WaylandWindow {
 
         let inner = handle.borrow();
         inner.raw_window_handle()
+    }
+}
+
+fn frame_edge_to_window_edge(
+    frame_edge: wayland_csd_frame::ResizeEdge,
+) -> xdg_toplevel::ResizeEdge {
+    use wayland_csd_frame::ResizeEdge;
+    use xdg_toplevel::ResizeEdge as XdgResizeEdge;
+    match frame_edge {
+        ResizeEdge::None => XdgResizeEdge::None,
+        ResizeEdge::Top => XdgResizeEdge::Top,
+        ResizeEdge::Bottom => XdgResizeEdge::Bottom,
+        ResizeEdge::Left => XdgResizeEdge::Left,
+        ResizeEdge::TopLeft => XdgResizeEdge::TopLeft,
+        ResizeEdge::BottomLeft => XdgResizeEdge::BottomLeft,
+        ResizeEdge::Right => XdgResizeEdge::Right,
+        ResizeEdge::TopRight => XdgResizeEdge::TopRight,
+        ResizeEdge::BottomRight => XdgResizeEdge::BottomRight,
+        _ => XdgResizeEdge::None,
     }
 }
